@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+usage() {
+  cat <<'EOF'
+Uso: garage-setup [--capacity 80G]
+
+Instala o Garage (S3) e o painel garage-webui em ~/komodo/garage.
+Pode rodar de novo sem medo: o que já existe (segredos, layout, chave de backup) é mantido.
+
+  --capacity <tamanho>   espaço reservado ao Garage no layout (padrão: 80G)
+  -h, --help             mostra esta ajuda
+EOF
+}
+
+die() { echo "Erro: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+
+CAPACITY="80G"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --capacity) [[ $# -ge 2 ]] || die "--capacity precisa de um valor"; CAPACITY="$2"; shift 2 ;;
+    *) die "opção desconhecida: $1 (use --help)" ;;
+  esac
+done
+[[ "$CAPACITY" =~ ^[0-9]+[KMGT]B?$ ]] || die "capacidade inválida: $CAPACITY (ex.: 80G)"
+
+KIT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+KOMODO_DIR="${KOMODO_DIR:-$HOME/komodo}"
+GARAGE_DIR="$KOMODO_DIR/garage"
+CONTAINER="garage"
+CREDENTIALS_FILE="$GARAGE_DIR/webui-credentials.txt"
+
+command -v docker >/dev/null || die "docker não encontrado"
+command -v openssl >/dev/null || die "openssl não encontrado"
+
+garage() { docker exec -e RUST_LOG=warn "$CONTAINER" /garage "$@"; }
+
+install_file() {
+  local name=$1
+  if [[ ! -f "$GARAGE_DIR/$name" ]]; then
+    install -m 644 "$KIT_DIR/$name" "$GARAGE_DIR/$name"
+    info "Copiado $name"
+  elif ! cmp -s "$KIT_DIR/$name" "$GARAGE_DIR/$name"; then
+    echo "Aviso: $GARAGE_DIR/$name é diferente do kit. Mantive o atual (compare com: diff $KIT_DIR/$name $GARAGE_DIR/$name)" >&2
+  fi
+}
+
+write_secrets() {
+  if [[ -f "$GARAGE_DIR/.env" ]]; then
+    return 0
+  fi
+  {
+    echo "GARAGE_RPC_SECRET=$(openssl rand -hex 32)"
+    echo "GARAGE_ADMIN_TOKEN=$(openssl rand -hex 32)"
+    echo "GARAGE_METRICS_TOKEN=$(openssl rand -hex 32)"
+  } > "$GARAGE_DIR/.env"
+  chmod 600 "$GARAGE_DIR/.env"
+  info "Segredos do Garage gerados em $GARAGE_DIR/.env"
+}
+
+write_webui_env() {
+  local password hash admin_token
+  if [[ -f "$GARAGE_DIR/webui.env" ]]; then
+    return 0
+  fi
+  password=$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-24)
+  hash=$(printf '%s' "$password" | docker run --rm -i caddy:2-alpine caddy hash-password)
+  [[ "$hash" == '$2'* ]] || die "não consegui gerar o hash da senha do painel"
+  admin_token=$(sed -n 's/^GARAGE_ADMIN_TOKEN=//p' "$GARAGE_DIR/.env")
+  {
+    echo "AUTH_USER_PASS='admin:$hash'"
+    echo "API_ADMIN_KEY=$admin_token"
+  } > "$GARAGE_DIR/webui.env"
+  chmod 600 "$GARAGE_DIR/webui.env"
+  printf 'Painel do Garage (http://localhost:3909 pelo túnel SSH)\nusuário: admin\nsenha: %s\n' "$password" > "$CREDENTIALS_FILE"
+  chmod 600 "$CREDENTIALS_FILE"
+  info "Senha do painel gerada em $CREDENTIALS_FILE"
+}
+
+apply_layout() {
+  local node_id version
+  version=$(garage layout show 2>/dev/null | sed -n 's/.*[Cc]urrent cluster layout version: *\([0-9]\+\).*/\1/p' | head -n 1)
+  if [[ -n "$version" && "$version" != "0" ]]; then
+    info "Layout já aplicado (versão $version)"
+    return 0
+  fi
+  node_id=$(garage node id -q | cut -d@ -f1)
+  [[ -n "$node_id" ]] || die "não consegui ler o ID do nó"
+  info "Aplicando o layout (zona dc1, capacidade $CAPACITY)"
+  garage layout assign -z dc1 -c "$CAPACITY" "$node_id" >/dev/null
+  garage layout apply --version 1 >/dev/null
+}
+
+ensure_backup_key() {
+  if garage key info backup --key-id >/dev/null 2>&1; then
+    info "Chave de backup já existe"
+    return 0
+  fi
+  garage key create backup >/dev/null
+  info "Chave de backup criada (só leitura, liberada bucket a bucket pelo backup-run)"
+}
+
+mkdir -p "$GARAGE_DIR"
+chmod 700 "$GARAGE_DIR"
+install_file compose.yaml
+install_file garage.toml
+write_secrets
+write_webui_env
+
+if ! docker network inspect storage >/dev/null 2>&1; then
+  info "Criando a rede storage"
+  docker network create storage >/dev/null
+fi
+
+info "Subindo o Garage e o painel"
+(cd "$GARAGE_DIR" && docker compose up -d --wait)
+
+apply_layout
+ensure_backup_key
+
+cat <<EOF
+
+Pronto. Garage rodando em $GARAGE_DIR
+
+  S3 para os apps:   http://garage:3900 (rede storage)
+  S3 na VPS:         http://127.0.0.1:3900
+  Painel:            ssh -L 3909:localhost:3909 vps  ->  http://localhost:3909
+EOF
+if [[ -f "$CREDENTIALS_FILE" ]]; then
+  cat <<EOF
+
+  A senha do painel está em $CREDENTIALS_FILE.
+  Guarde no gerenciador de senhas e apague o arquivo: rm $CREDENTIALS_FILE
+EOF
+fi

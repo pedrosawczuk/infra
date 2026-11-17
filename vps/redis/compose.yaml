@@ -1,0 +1,48 @@
+services:
+  redis:
+    image: redis:8-alpine
+    container_name: redis
+    restart: unless-stopped
+    user: redis
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 768m
+    environment:
+      REDIS_ADMIN_USER: ${REDIS_ADMIN_USER:-admin}
+      REDIS_ADMIN_PASSWORD: ${REDIS_ADMIN_PASSWORD:?defina REDIS_ADMIN_PASSWORD no .env}
+    command:
+      - sh
+      - -c
+      - |
+        umask 077
+        test -f /data/users.acl || printf 'user default off\nuser %s on >%s ~* &* +@all\n' "$$REDIS_ADMIN_USER" "$$REDIS_ADMIN_PASSWORD" > /data/users.acl
+        exec redis-server \
+          --aclfile /data/users.acl \
+          --appendonly yes \
+          --appendfsync everysec \
+          --maxmemory 512mb \
+          --maxmemory-policy noeviction \
+          --protected-mode yes
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_ADMIN_PASSWORD\" redis-cli --user \"$$REDIS_ADMIN_USER\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    volumes:
+      - redis_data:/data
+    networks:
+      - cache
+
+volumes:
+  redis_data:
+    name: redis_data
+
+networks:
+  cache:
+    external: true

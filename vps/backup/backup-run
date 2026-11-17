@@ -1,0 +1,459 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+usage() {
+  cat <<'EOF'
+Uso: backup-run [opções]
+
+Faz o backup diário da VPS: Postgres, Redis, configs e banco do Komodo.
+Verifica cada arquivo, faz a rotação local e envia para o Drive criptografado.
+Depois copia os buckets do Garage (S3) para o Drive: s3/current guarda o estado atual
+e s3/history/<data> guarda o que foi apagado ou alterado em cada dia.
+
+Opções:
+  --restore-test   roda o teste de restauração mesmo fora do dia configurado
+  --no-remote      não envia para o Drive
+  -h, --help       mostra esta ajuda
+
+Configuração: ~/komodo/backup.env (veja backup.env.example)
+EOF
+}
+
+FORCE_RESTORE_TEST=0
+SKIP_REMOTE=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --restore-test) FORCE_RESTORE_TEST=1; shift ;;
+    --no-remote) SKIP_REMOTE=1; shift ;;
+    *) echo "Erro: opção desconhecida: $1" >&2; exit 1 ;;
+  esac
+done
+
+CONFIG_FILE="${BACKUP_CONFIG:-$HOME/komodo/backup.env}"
+[[ -f "$CONFIG_FILE" ]] || { echo "Erro: não achei $CONFIG_FILE" >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+BACKUP_DIR="${BACKUP_DIR:-$HOME/backups}"
+DATA_DIR="$BACKUP_DIR/data"
+LOG_DIR="$BACKUP_DIR/logs"
+KEEP_DAILY="${KEEP_DAILY:-7}"
+KEEP_WEEKLY="${KEEP_WEEKLY:-4}"
+KEEP_MONTHLY="${KEEP_MONTHLY:-6}"
+PG_CONTAINER="${PG_CONTAINER:-postgres}"
+PG_ADMIN_USER="${PG_ADMIN_USER:-admin}"
+REDIS_CONTAINER="${REDIS_CONTAINER:-redis}"
+REDIS_ENV_FILE="${REDIS_ENV_FILE:-$HOME/komodo/redis/.env}"
+KOMODO_BACKUPS_DIR="${KOMODO_BACKUPS_DIR:-/etc/komodo/backups}"
+CONFIG_SOURCE_DIR="${CONFIG_SOURCE_DIR:-$HOME/komodo}"
+RCLONE="${RCLONE_BIN:-$HOME/.local/bin/rclone}"
+RCLONE_REMOTE="${RCLONE_REMOTE:-}"
+REMOTE_TRASH_DAYS="${REMOTE_TRASH_DAYS:-30}"
+REMOTE_MAX_DELETE="${REMOTE_MAX_DELETE:-40}"
+RESTORE_TEST_WEEKDAY="${RESTORE_TEST_WEEKDAY:-7}"
+SHRINK_ALERT_PERCENT="${SHRINK_ALERT_PERCENT:-50}"
+MIN_FREE_MB="${MIN_FREE_MB:-1024}"
+LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-60}"
+HC_PING_URL="${HC_PING_URL:-}"
+GARAGE_CONTAINER="${GARAGE_CONTAINER:-garage}"
+GARAGE_S3_ENDPOINT="${GARAGE_S3_ENDPOINT:-http://127.0.0.1:3900}"
+S3_HISTORY_DAYS="${S3_HISTORY_DAYS:-60}"
+S3_MAX_DELETE="${S3_MAX_DELETE:-500}"
+S3_SHRINK_ALERT_PERCENT="${S3_SHRINK_ALERT_PERCENT:-$SHRINK_ALERT_PERCENT}"
+DISK_ALERT_PERCENT="${DISK_ALERT_PERCENT:-80}"
+
+TODAY=$(date +%F)
+STAGE="$DATA_DIR/.tmp-$TODAY"
+LOG_FILE="$LOG_DIR/$TODAY.log"
+WARNINGS=()
+SHRUNK=0
+PREVIOUS=""
+
+mkdir -p "$DATA_DIR/daily" "$DATA_DIR/weekly" "$DATA_DIR/monthly" "$LOG_DIR"
+chmod 700 "$BACKUP_DIR" "$DATA_DIR" "$LOG_DIR"
+
+exec 9>"$BACKUP_DIR/.lock"
+flock -n 9 || { echo "Erro: outro backup está em andamento" >&2; exit 1; }
+
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+log() { printf '%s %s\n' "$(date +%T)" "$*"; }
+warn() { WARNINGS+=("$*"); log "AVISO: $*"; }
+
+hc_ping() {
+  if [[ -z "$HC_PING_URL" ]]; then
+    cat > /dev/null
+    return 0
+  fi
+  curl -fsS -m 10 --retry 3 -o /dev/null --data-binary @- "$HC_PING_URL$1" || log "não consegui avisar o healthchecks.io"
+}
+
+on_error() {
+  local code=$? line=$1
+  trap - ERR
+  set +e
+  log "FALHOU na linha $line (código $code)"
+  rm -rf "$STAGE"
+  tail -n 60 "$LOG_FILE" | hc_ping /fail
+  exit "$code"
+}
+trap 'on_error $LINENO' ERR
+
+list_backups() {
+  find "$1" -mindepth 1 -maxdepth 1 -type d -name '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' -printf '%f\n' | sort
+}
+
+human_size() { du -sh "$1" | cut -f1; }
+
+pg_query() {
+  docker exec -e PGOPTIONS='-c client_min_messages=warning' "$PG_CONTAINER" \
+    psql -U "$PG_ADMIN_USER" -d "${2:-postgres}" -tAX -v ON_ERROR_STOP=1 -c "$1"
+}
+
+check_shrink() {
+  local rel=$1 old new
+  [[ -n "$PREVIOUS" && -f "$DATA_DIR/daily/$PREVIOUS/$rel" ]] || return 0
+  old=$(stat -c %s "$DATA_DIR/daily/$PREVIOUS/$rel")
+  new=$(stat -c %s "$STAGE/$rel")
+  if (( old > 0 && new * 100 < old * (100 - SHRINK_ALERT_PERCENT) )); then
+    warn "$rel encolheu de $old para $new bytes desde $PREVIOUS. A rotação diária foi pausada."
+    SHRUNK=1
+  fi
+}
+
+preflight() {
+  local free_mb
+  free_mb=$(df --output=avail -m "$BACKUP_DIR" | tail -n 1 | tr -d ' ')
+  (( free_mb >= MIN_FREE_MB )) || { log "Espaço livre insuficiente: ${free_mb} MB (mínimo ${MIN_FREE_MB} MB)"; return 1; }
+  docker ps --format '{{.Names}}' | grep -qx "$PG_CONTAINER" || { log "container $PG_CONTAINER não está rodando"; return 1; }
+  find "$DATA_DIR" -mindepth 1 -maxdepth 1 -type d -name '.tmp-*' -exec rm -rf {} +
+  PREVIOUS=$(list_backups "$DATA_DIR/daily" | grep -vx "$TODAY" | tail -n 1 || true)
+  mkdir -p "$STAGE"
+}
+
+backup_postgres() {
+  local db databases
+  mkdir -p "$STAGE/postgres"
+  docker exec "$PG_CONTAINER" pg_dumpall -U "$PG_ADMIN_USER" --globals-only > "$STAGE/postgres/globals.sql"
+  [[ -s "$STAGE/postgres/globals.sql" ]]
+  mapfile -t databases < <(pg_query "SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY 1")
+  (( ${#databases[@]} > 0 ))
+  for db in "${databases[@]}"; do
+    docker exec "$PG_CONTAINER" pg_dump -U "$PG_ADMIN_USER" -Fc -Z 6 -d "$db" > "$STAGE/postgres/$db.dump"
+    docker exec -i "$PG_CONTAINER" pg_restore --list < "$STAGE/postgres/$db.dump" > /dev/null
+    log "postgres: $db ($(human_size "$STAGE/postgres/$db.dump"))"
+    check_shrink "postgres/$db.dump"
+  done
+}
+
+backup_redis() {
+  local user pass output
+  if ! docker ps --format '{{.Names}}' | grep -qx "$REDIS_CONTAINER"; then
+    log "redis: container não está rodando, pulando"
+    return 0
+  fi
+  if [[ ! -r "$REDIS_ENV_FILE" ]]; then
+    warn "redis: não consegui ler $REDIS_ENV_FILE"
+    return 0
+  fi
+  user=$(sed -n 's/^REDIS_ADMIN_USER=//p' "$REDIS_ENV_FILE")
+  pass=$(sed -n 's/^REDIS_ADMIN_PASSWORD=//p' "$REDIS_ENV_FILE")
+  mkdir -p "$STAGE/redis"
+  if ! output=$(REDISCLI_AUTH="$pass" docker exec -e REDISCLI_AUTH "$REDIS_CONTAINER" \
+    redis-cli --user "${user:-admin}" --no-auth-warning --rdb /tmp/backup.rdb 2>&1); then
+    log "$output"
+    return 1
+  fi
+  docker exec "$REDIS_CONTAINER" cat /tmp/backup.rdb > "$STAGE/redis/dump.rdb"
+  docker exec "$REDIS_CONTAINER" rm -f /tmp/backup.rdb
+  [[ -s "$STAGE/redis/dump.rdb" ]]
+  log "redis: snapshot ($(human_size "$STAGE/redis/dump.rdb"))"
+}
+
+backup_configs() {
+  tar -C "$(dirname "$CONFIG_SOURCE_DIR")" -czf "$STAGE/configs.tar.gz" \
+    --exclude='*.bak-*' --exclude='backup-crypt-keys.txt' --exclude='webui-credentials.txt' "$(basename "$CONFIG_SOURCE_DIR")"
+  tar -tzf "$STAGE/configs.tar.gz" > /dev/null
+  log "configs: $CONFIG_SOURCE_DIR ($(human_size "$STAGE/configs.tar.gz"))"
+}
+
+backup_komodo() {
+  local latest
+  latest=$(list_backups_any "$KOMODO_BACKUPS_DIR" | tail -n 1)
+  if [[ -z "$latest" ]]; then
+    warn "komodo: nenhum backup encontrado em $KOMODO_BACKUPS_DIR"
+    return 0
+  fi
+  tar -C "$KOMODO_BACKUPS_DIR" -czf "$STAGE/komodo-db.tar.gz" "$latest"
+  log "komodo: $latest ($(human_size "$STAGE/komodo-db.tar.gz"))"
+}
+
+list_backups_any() {
+  [[ -d "$1" ]] || return 0
+  find "$1" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+}
+
+finalize() {
+  local sums
+  sums=$(cd "$STAGE" && find . -type f ! -name 'SHA256SUMS*' -printf '%P\n' | sort | xargs -d '\n' sha256sum)
+  printf '%s\n' "$sums" > "$STAGE/SHA256SUMS"
+  (cd "$STAGE" && sha256sum --quiet -c SHA256SUMS)
+  rm -rf "$DATA_DIR/daily/$TODAY"
+  mv "$STAGE" "$DATA_DIR/daily/$TODAY"
+  log "backup salvo em daily/$TODAY ($(human_size "$DATA_DIR/daily/$TODAY"))"
+}
+
+promote() {
+  local tier=$1 period_format=$2 newest
+  newest=$(list_backups "$DATA_DIR/$tier" | tail -n 1)
+  if [[ "$newest" == "$TODAY" ]]; then
+    rm -rf "${DATA_DIR:?}/$tier/$TODAY"
+    cp -al "$DATA_DIR/daily/$TODAY" "$DATA_DIR/$tier/$TODAY"
+    log "atualizado $tier/$TODAY"
+  elif [[ -z "$newest" || "$(date -d "$newest" +"$period_format")" != "$(date +"$period_format")" ]]; then
+    cp -al "$DATA_DIR/daily/$TODAY" "$DATA_DIR/$tier/$TODAY"
+    log "promovido para $tier/$TODAY"
+  fi
+}
+
+rotate() {
+  local tier=$1 keep=$2 dir
+  list_backups "$DATA_DIR/$tier" | head -n -"$keep" | while read -r dir; do
+    rm -rf "${DATA_DIR:?}/$tier/$dir"
+    log "rotação: removido $tier/$dir"
+  done
+}
+
+count_tables() {
+  pg_query "SELECT count(*) FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema')" "$1"
+}
+
+count_rows() {
+  pg_query "SELECT coalesce(sum((xpath('/row/c/text()', query_to_xml(format('SELECT count(*) AS c FROM %I.%I', table_schema, table_name), false, true, '')))[1]::text::bigint), 0) FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema')" "$1"
+}
+
+restore_test() {
+  local dump db test_db src_tables dst_tables src_rows dst_rows
+  for dump in "$DATA_DIR/daily/$TODAY/postgres/"*.dump; do
+    db=$(basename "$dump" .dump)
+    test_db="restore_test_$db"
+    pg_query "DROP DATABASE IF EXISTS \"$test_db\"" > /dev/null
+    pg_query "CREATE DATABASE \"$test_db\"" > /dev/null
+    if docker exec -i "$PG_CONTAINER" pg_restore -U "$PG_ADMIN_USER" -d "$test_db" \
+      --no-owner --no-acl --exit-on-error < "$dump"; then
+      src_tables=$(count_tables "$db")
+      dst_tables=$(count_tables "$test_db")
+      src_rows=$(count_rows "$db")
+      dst_rows=$(count_rows "$test_db")
+      if [[ "$src_tables" != "$dst_tables" ]]; then
+        warn "teste de restauração: $db tem $src_tables tabelas, a cópia restaurada tem $dst_tables"
+      elif (( src_rows > 0 && dst_rows == 0 )); then
+        warn "teste de restauração: $db tem $src_rows linhas, a cópia restaurada está vazia"
+      else
+        log "teste de restauração: $db ok ($dst_tables tabelas, $dst_rows linhas)"
+      fi
+    else
+      warn "teste de restauração: pg_restore falhou para $db"
+    fi
+    pg_query "DROP DATABASE IF EXISTS \"$test_db\"" > /dev/null
+  done
+}
+
+sync_remote() {
+  local cutoff dir
+  if [[ "$SKIP_REMOTE" == 1 || -z "$RCLONE_REMOTE" ]]; then
+    log "drive: envio desativado"
+    return 0
+  fi
+  if ! "$RCLONE" sync "$DATA_DIR" "${RCLONE_REMOTE}data" \
+    --exclude '.tmp-*/**' \
+    --backup-dir "${RCLONE_REMOTE}trash/$TODAY" \
+    --max-delete "$REMOTE_MAX_DELETE" \
+    --transfers 2 --retries 5 --low-level-retries 10 \
+    --log-level NOTICE; then
+    warn "drive: o envio falhou. O backup local está salvo."
+    return 0
+  fi
+  if ! "$RCLONE" cryptcheck "$DATA_DIR/daily/$TODAY" "${RCLONE_REMOTE}data/daily/$TODAY" --log-level ERROR; then
+    warn "drive: a conferência do backup enviado falhou"
+    return 0
+  fi
+  log "drive: enviado e conferido"
+  cutoff=$(date -d "-$REMOTE_TRASH_DAYS days" +%F)
+  while read -r dir; do
+    dir=${dir%/}
+    if [[ "$dir" < "$cutoff" ]]; then
+      "$RCLONE" purge "${RCLONE_REMOTE}trash/$dir" && log "drive: lixeira $dir apagada"
+    fi
+  done < <("$RCLONE" lsf --dirs-only "${RCLONE_REMOTE}trash" 2>/dev/null || true)
+}
+
+check_disk_usage() {
+  local used
+  used=$(df --output=pcent / | tail -n 1 | tr -dc '0-9')
+  if (( used >= DISK_ALERT_PERCENT )); then
+    warn "disco: / está com ${used}% de uso (alerta a partir de ${DISK_ALERT_PERCENT}%)"
+  fi
+}
+
+garage_running() { docker ps --format '{{.Names}}' | grep -qx "$GARAGE_CONTAINER"; }
+
+garage_cli() { docker exec -e RUST_LOG=warn "$GARAGE_CONTAINER" /garage "$@"; }
+
+garage_bucket_names() {
+  garage_cli bucket list | awk 'NR > 1 && $1 ~ /^[0-9a-f]+$/ { for (i = 3; i <= NF; i++) if ($i ~ /^[a-z0-9][a-z0-9.-]+$/) { print $i; break } }' | sort -u
+}
+
+backup_garage_meta() {
+  local bucket
+  if ! garage_running; then
+    log "garage: container não está rodando, pulando"
+    return 0
+  fi
+  mkdir -p "$STAGE/garage"
+  if ! { garage_cli status > "$STAGE/garage/status.txt" \
+    && garage_cli bucket list > "$STAGE/garage/buckets.txt" \
+    && garage_cli key list > "$STAGE/garage/keys.txt"; }; then
+    warn "garage: não consegui ler o estado do Garage"
+    rm -rf "$STAGE/garage"
+    return 0
+  fi
+  : > "$STAGE/garage/buckets-info.txt"
+  while read -r bucket; do
+    garage_cli bucket info "$bucket" >> "$STAGE/garage/buckets-info.txt" \
+      || warn "garage: não consegui ler as informações do bucket $bucket"
+  done < <(garage_bucket_names)
+  log "garage: buckets, chaves e permissões salvos ($(garage_bucket_names | wc -l) bucket(s))"
+}
+
+rclone_s3() {
+  RCLONE_CONFIG_GARAGE_TYPE=s3 \
+  RCLONE_CONFIG_GARAGE_PROVIDER=Other \
+  RCLONE_CONFIG_GARAGE_ENDPOINT="$GARAGE_S3_ENDPOINT" \
+  RCLONE_CONFIG_GARAGE_REGION=garage \
+  RCLONE_CONFIG_GARAGE_FORCE_PATH_STYLE=true \
+  RCLONE_CONFIG_GARAGE_ACCESS_KEY_ID="$S3_BACKUP_KEY_ID" \
+  RCLONE_CONFIG_GARAGE_SECRET_ACCESS_KEY="$S3_BACKUP_SECRET" \
+    "$RCLONE" "$@"
+}
+
+object_count() {
+  local json
+  json=$(rclone_s3 size --json "$1" 2>/dev/null) || { echo 0; return 0; }
+  sed -E 's/.*"count":([0-9]+).*/\1/' <<<"$json"
+}
+
+sync_bucket() {
+  local bucket=$1 src="garage:$1" dst="${RCLONE_REMOTE}s3/current/$1" src_count dst_count
+  if ! garage_cli bucket allow --read "$bucket" --key backup > /dev/null; then
+    warn "s3: não consegui liberar leitura do bucket $bucket para a chave backup"
+    return 0
+  fi
+  src_count=$(object_count "$src")
+  dst_count=$(object_count "$dst")
+  if (( dst_count > 0 && src_count * 100 < dst_count * (100 - S3_SHRINK_ALERT_PERCENT) )); then
+    warn "s3: $bucket caiu de $dst_count para $src_count objetos. Não sincronizei para proteger a cópia do Drive."
+    return 0
+  fi
+  if ! rclone_s3 sync "$src" "$dst" \
+    --backup-dir "${RCLONE_REMOTE}s3/history/$TODAY/$bucket" \
+    --max-delete "$S3_MAX_DELETE" \
+    --fast-list --transfers 4 --checkers 8 --retries 5 --low-level-retries 10 \
+    --log-level NOTICE; then
+    warn "s3: a cópia do bucket $bucket falhou"
+    return 0
+  fi
+  log "s3: $bucket sincronizado ($src_count objetos)"
+  if [[ "$FORCE_RESTORE_TEST" == 1 || "$(date +%u)" == "$RESTORE_TEST_WEEKDAY" ]]; then
+    local check_output
+    if check_output=$(rclone_s3 check "$src" "$dst" --size-only --one-way --log-level ERROR 2>&1); then
+      log "s3: conferência semanal de $bucket ok"
+    else
+      grep -v 'No common hash' <<<"$check_output" | tail -n 20
+      warn "s3: a conferência semanal de $bucket encontrou diferenças"
+    fi
+  fi
+}
+
+prune_s3_history() {
+  local cutoff dir
+  cutoff=$(date -d "-$S3_HISTORY_DAYS days" +%F)
+  while read -r dir; do
+    dir=${dir%/}
+    if [[ "$dir" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ && "$dir" < "$cutoff" ]]; then
+      "$RCLONE" purge "${RCLONE_REMOTE}s3/history/$dir" && log "s3: histórico de $dir apagado (mais de $S3_HISTORY_DAYS dias)"
+    fi
+  done < <("$RCLONE" lsf --dirs-only "${RCLONE_REMOTE}s3/history" 2>/dev/null || true)
+}
+
+sync_buckets() {
+  local buckets bucket remote_bucket
+  if ! garage_running; then
+    log "s3: Garage não está rodando, pulando"
+    return 0
+  fi
+  if [[ "$SKIP_REMOTE" == 1 || -z "$RCLONE_REMOTE" ]]; then
+    log "s3: envio desativado"
+    return 0
+  fi
+  if ! S3_BACKUP_KEY_ID=$(garage_cli key info backup --key-id 2>/dev/null) \
+    || ! S3_BACKUP_SECRET=$(garage_cli key info backup --secret-key 2>/dev/null); then
+    warn "s3: a chave backup não existe no Garage. Rode o garage-setup."
+    return 0
+  fi
+  mapfile -t buckets < <(garage_bucket_names)
+  for bucket in "${buckets[@]}"; do
+    sync_bucket "$bucket"
+  done
+  while read -r remote_bucket; do
+    remote_bucket=${remote_bucket%/}
+    if [[ -n "$remote_bucket" ]] && ! printf '%s\n' "${buckets[@]}" | grep -qx "$remote_bucket"; then
+      log "s3: o bucket $remote_bucket não existe mais no Garage. A cópia no Drive foi mantida."
+    fi
+  done < <("$RCLONE" lsf --dirs-only "${RCLONE_REMOTE}s3/current" 2>/dev/null || true)
+  prune_s3_history
+  unset S3_BACKUP_KEY_ID S3_BACKUP_SECRET
+}
+
+main() {
+  log "=== backup $TODAY ==="
+  hc_ping /start < /dev/null
+  preflight
+  backup_postgres
+  backup_redis
+  backup_configs
+  backup_komodo
+  backup_garage_meta
+  finalize
+
+  promote weekly '%G-W%V'
+  promote monthly '%Y-%m'
+  if [[ "$SHRUNK" == 0 ]]; then
+    rotate daily "$KEEP_DAILY"
+  fi
+  rotate weekly "$KEEP_WEEKLY"
+  rotate monthly "$KEEP_MONTHLY"
+
+  if [[ "$FORCE_RESTORE_TEST" == 1 || "$(date +%u)" == "$RESTORE_TEST_WEEKDAY" ]]; then
+    restore_test
+  fi
+
+  sync_remote
+  sync_buckets
+  check_disk_usage
+  find "$LOG_DIR" -type f -name '*.log' -mtime +"$LOG_RETENTION_DAYS" -delete
+
+  local summary
+  summary="backup $TODAY: $(human_size "$DATA_DIR/daily/$TODAY"), ${#WARNINGS[@]} aviso(s)"
+  if (( ${#WARNINGS[@]} > 0 )); then
+    log "$summary"
+    printf '%s\n' "$summary" "${WARNINGS[@]}" | hc_ping /fail
+    exit 2
+  fi
+  log "$summary"
+  printf '%s\n' "$summary" | hc_ping ""
+}
+
+main

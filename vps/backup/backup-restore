@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+usage() {
+  cat <<'EOF'
+Uso: backup-restore <comando> [argumentos]
+
+Comandos:
+  list                          lista os backups locais e os do Drive
+  fetch <data>                  baixa um backup do Drive para ~/backups/restore/<data> e confere
+  db <banco> [data] [--replace] restaura um banco do Postgres
+                                  sem --replace: cria <banco>_restored_<data> ao lado do original
+                                  com --replace: apaga o banco atual e restaura no lugar
+  files <data>                  extrai as configs em ~/backups/restore/<data>/configs (só para consulta)
+  verify <data>                 confere os checksums de um backup
+
+Arquivos do Garage (S3), direto do Drive:
+  s3 list                       buckets copiados e datas com histórico
+  s3 find <bucket> <texto>      procura arquivos pelo nome na cópia atual e no histórico
+  s3 fetch <bucket> <caminho> [data]
+                                baixa para ~/backups/restore/s3 (não mexe no Garage)
+  s3 restore <bucket> <caminho> [data] [--replace]
+                                devolve o arquivo (ou a pasta, terminando em /) ao bucket
+                                  sem data: da cópia atual · com data: do histórico desse dia
+                                  sem --replace: não sobrescreve o que já existe no bucket
+
+<data> no formato AAAA-MM-DD. Sem data, usa o backup diário mais recente.
+
+Exemplos:
+  backup-restore list
+  backup-restore db estudazz_api
+  backup-restore db estudazz_api 2026-11-14 --replace
+  backup-restore fetch 2026-10-01
+  backup-restore s3 find meu-app contrato
+  backup-restore s3 restore meu-app uploads/contrato.pdf 2026-11-15
+EOF
+}
+
+die() { echo "Erro: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+
+CONFIG_FILE="${BACKUP_CONFIG:-$HOME/komodo/backup.env}"
+[[ -f "$CONFIG_FILE" ]] || die "não achei $CONFIG_FILE"
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+BACKUP_DIR="${BACKUP_DIR:-$HOME/backups}"
+DATA_DIR="$BACKUP_DIR/data"
+RESTORE_DIR="$BACKUP_DIR/restore"
+PG_CONTAINER="${PG_CONTAINER:-postgres}"
+PG_ADMIN_USER="${PG_ADMIN_USER:-admin}"
+RCLONE="${RCLONE_BIN:-$HOME/.local/bin/rclone}"
+RCLONE_REMOTE="${RCLONE_REMOTE:-}"
+GARAGE_CONTAINER="${GARAGE_CONTAINER:-garage}"
+GARAGE_S3_ENDPOINT="${GARAGE_S3_ENDPOINT:-http://127.0.0.1:3900}"
+TIERS=(daily weekly monthly)
+
+list_backups() {
+  [[ -d "$1" ]] || return 0
+  find "$1" -mindepth 1 -maxdepth 1 -type d -name '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' -printf '%f\n' | sort
+}
+
+valid_date() { [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die "data inválida: $1 (use AAAA-MM-DD)"; }
+
+latest_daily() {
+  local latest
+  latest=$(list_backups "$DATA_DIR/daily" | tail -n 1)
+  [[ -n "$latest" ]] || die "nenhum backup diário local"
+  echo "$latest"
+}
+
+find_backup() {
+  local date=$1 tier
+  for tier in "${TIERS[@]}"; do
+    if [[ -d "$DATA_DIR/$tier/$date" ]]; then echo "$DATA_DIR/$tier/$date"; return 0; fi
+  done
+  if [[ -d "$RESTORE_DIR/$date" ]]; then echo "$RESTORE_DIR/$date"; return 0; fi
+  die "backup $date não está na VPS. Baixe do Drive com: backup-restore fetch $date"
+}
+
+pg_query() {
+  docker exec -e PGOPTIONS='-c client_min_messages=warning' "$PG_CONTAINER" \
+    psql -U "$PG_ADMIN_USER" -d postgres -tAX -v ON_ERROR_STOP=1 -c "$1"
+}
+
+require_remote() {
+  [[ -n "$RCLONE_REMOTE" ]] || die "RCLONE_REMOTE não está definido em $CONFIG_FILE"
+  [[ -x "$RCLONE" ]] || die "rclone não encontrado em $RCLONE"
+}
+
+cmd_list() {
+  local tier
+  for tier in "${TIERS[@]}"; do
+    echo "VPS · $tier:"
+    list_backups "$DATA_DIR/$tier" | sed 's/^/  /'
+  done
+  if [[ -d "$RESTORE_DIR" ]]; then
+    echo "VPS · baixados do Drive:"
+    list_backups "$RESTORE_DIR" | sed 's/^/  /'
+  fi
+  if [[ -n "$RCLONE_REMOTE" && -x "$RCLONE" ]]; then
+    for tier in "${TIERS[@]}"; do
+      echo "Drive · $tier:"
+      "$RCLONE" lsf --dirs-only "${RCLONE_REMOTE}data/$tier" 2>/dev/null | tr -d '/' | sort | sed 's/^/  /'
+    done
+  fi
+}
+
+cmd_verify() {
+  local dir
+  dir=$(find_backup "${1:-$(latest_daily)}")
+  info "Conferindo $dir"
+  (cd "$dir" && sha256sum --quiet -c SHA256SUMS)
+  info "Todos os arquivos conferem"
+}
+
+cmd_fetch() {
+  local date=${1:-} tier found=""
+  [[ -n "$date" ]] || die "informe a data: backup-restore fetch AAAA-MM-DD"
+  valid_date "$date"
+  require_remote
+  for tier in "${TIERS[@]}"; do
+    if "$RCLONE" lsf --dirs-only "${RCLONE_REMOTE}data/$tier" 2>/dev/null | grep -qx "$date/"; then
+      found=$tier
+      break
+    fi
+  done
+  [[ -n "$found" ]] || die "backup $date não está no Drive. Veja as datas com: backup-restore list"
+  mkdir -p "$RESTORE_DIR"
+  chmod 700 "$RESTORE_DIR"
+  info "Baixando $found/$date do Drive"
+  "$RCLONE" copy "${RCLONE_REMOTE}data/$found/$date" "$RESTORE_DIR/$date" --log-level NOTICE
+  (cd "$RESTORE_DIR/$date" && sha256sum --quiet -c SHA256SUMS)
+  info "Baixado e conferido em $RESTORE_DIR/$date"
+}
+
+cmd_files() {
+  local date=${1:-} dir
+  date=${date:-$(latest_daily)}
+  valid_date "$date"
+  dir=$(find_backup "$date")
+  mkdir -p "$RESTORE_DIR/$date/configs"
+  tar -xzf "$dir/configs.tar.gz" -C "$RESTORE_DIR/$date/configs"
+  info "Configs extraídas em $RESTORE_DIR/$date/configs"
+  echo "Nada foi alterado na VPS. Compare e copie manualmente o que precisar."
+}
+
+cmd_db() {
+  local db="" date="" replace=0 arg dir dump owner target answer
+  for arg in "$@"; do
+    case "$arg" in
+      --replace) replace=1 ;;
+      *) if [[ -z "$db" ]]; then db=$arg; elif [[ -z "$date" ]]; then date=$arg; else die "argumento a mais: $arg"; fi ;;
+    esac
+  done
+  [[ -n "$db" ]] || die "informe o banco: backup-restore db <banco> [data] [--replace]"
+  [[ "$db" =~ ^[a-zA-Z0-9_]+$ ]] || die "nome de banco inválido: $db"
+  date=${date:-$(latest_daily)}
+  valid_date "$date"
+  dir=$(find_backup "$date")
+  dump="$dir/postgres/$db.dump"
+  [[ -f "$dump" ]] || die "o backup $date não tem o banco $db. Bancos disponíveis: $(cd "$dir/postgres" && ls -- *.dump | sed 's/\.dump$//' | tr '\n' ' ')"
+  (cd "$dir" && grep " postgres/$db.dump\$" SHA256SUMS | sha256sum --quiet -c -) || die "o arquivo $dump está corrompido"
+
+  owner=$(pg_query "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = '$db'")
+  if [[ -z "$owner" ]]; then
+    owner=$(pg_query "SELECT rolname FROM pg_roles WHERE rolname = '$db'")
+  fi
+  owner=${owner:-$PG_ADMIN_USER}
+
+  if [[ "$replace" == 1 ]]; then
+    target=$db
+    echo "ATENÇÃO: isso APAGA o banco $db atual e coloca no lugar o backup de $date."
+    echo "Tudo o que foi gravado em $db depois desse backup será perdido."
+    echo "Antes, pare o app que usa o banco (docker compose stop na pasta dele)."
+    read -rp "Para confirmar, digite o nome do banco ($db): " answer
+    [[ "$answer" == "$db" ]] || die "cancelado"
+    pg_query "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$db' AND pid <> pg_backend_pid()" > /dev/null
+    pg_query "DROP DATABASE IF EXISTS \"$db\"" > /dev/null
+  else
+    target="${db}_restored_${date//-/}"
+    pg_query "SELECT 1 FROM pg_database WHERE datname = '$target'" | grep -q 1 \
+      && die "o banco $target já existe. Apague antes com: DROP DATABASE \"$target\""
+  fi
+
+  info "Criando $target (dono: $owner)"
+  pg_query "CREATE DATABASE \"$target\" OWNER \"$owner\"" > /dev/null
+  info "Restaurando $db de $date"
+  docker exec -i "$PG_CONTAINER" pg_restore -U "$PG_ADMIN_USER" -d "$target" \
+    --no-owner --role="$owner" --exit-on-error < "$dump"
+  info "Pronto: $target restaurado a partir de $date"
+
+  if [[ "$replace" == 0 ]]; then
+    cat <<EOF
+
+O banco original $db não foi tocado. Para conferir:
+  docker exec -it $PG_CONTAINER psql -U $PG_ADMIN_USER -d $target
+
+Para trocar o original pela cópia restaurada (pare o app antes):
+  docker exec -it $PG_CONTAINER psql -U $PG_ADMIN_USER -d postgres \\
+    -c 'ALTER DATABASE "$db" RENAME TO "${db}_old"' \\
+    -c 'ALTER DATABASE "$target" RENAME TO "$db"'
+EOF
+  fi
+}
+
+valid_bucket() { [[ "$1" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || die "nome de bucket inválido: $1"; }
+
+valid_object_path() {
+  [[ -n "$1" && "$1" != /* && "$1" != *..* ]] || die "caminho inválido: $1 (relativo ao bucket, sem ..)"
+}
+
+s3_source() {
+  local bucket=$1 date=${2:-}
+  if [[ -z "$date" ]]; then
+    echo "${RCLONE_REMOTE}s3/current/$bucket"
+  else
+    valid_date "$date"
+    echo "${RCLONE_REMOTE}s3/history/$date/$bucket"
+  fi
+}
+
+cmd_s3_list() {
+  require_remote
+  echo "Drive · buckets (cópia atual):"
+  "$RCLONE" lsf --dirs-only "${RCLONE_REMOTE}s3/current" 2>/dev/null | tr -d '/' | sort | sed 's/^/  /'
+  echo "Drive · dias com histórico (apagados ou alterados):"
+  "$RCLONE" lsf --dirs-only "${RCLONE_REMOTE}s3/history" 2>/dev/null | tr -d '/' | sort | sed 's/^/  /'
+}
+
+cmd_s3_find() {
+  local bucket=${1:-} text=${2:-} day
+  [[ -n "$bucket" && -n "$text" ]] || die "uso: backup-restore s3 find <bucket> <texto>"
+  valid_bucket "$bucket"
+  require_remote
+  echo "Cópia atual:"
+  "$RCLONE" lsf -R --files-only --ignore-case --include "*$text*" "${RCLONE_REMOTE}s3/current/$bucket" 2>/dev/null | sed 's/^/  /'
+  while read -r day; do
+    day=${day%/}
+    "$RCLONE" lsf -R --files-only --ignore-case --include "*$text*" "${RCLONE_REMOTE}s3/history/$day/$bucket" 2>/dev/null \
+      | sed "s|^|  [$day] |"
+  done < <("$RCLONE" lsf --dirs-only "${RCLONE_REMOTE}s3/history" 2>/dev/null | sort -r)
+}
+
+cmd_s3_fetch() {
+  local bucket=${1:-} path=${2:-} date=${3:-} src dest
+  [[ -n "$bucket" && -n "$path" ]] || die "uso: backup-restore s3 fetch <bucket> <caminho> [data]"
+  valid_bucket "$bucket"
+  valid_object_path "$path"
+  require_remote
+  src=$(s3_source "$bucket" "$date")
+  dest="$RESTORE_DIR/s3/$bucket${date:+-$date}"
+  mkdir -p "$dest"
+  chmod 700 "$RESTORE_DIR" "$RESTORE_DIR/s3"
+  if [[ "$path" == */ ]]; then
+    "$RCLONE" copy "$src/$path" "$dest/$path" --log-level NOTICE
+  else
+    "$RCLONE" copyto "$src/$path" "$dest/$path" --log-level NOTICE
+  fi
+  info "Baixado em $dest/$path"
+}
+
+RESTORE_KEY_NAME=""
+
+delete_restore_key() {
+  [[ -n "$RESTORE_KEY_NAME" ]] || return 0
+  docker exec -e RUST_LOG=warn "$GARAGE_CONTAINER" /garage key delete --yes "$RESTORE_KEY_NAME" >/dev/null 2>&1 \
+    || echo "Aviso: não consegui apagar a chave temporária $RESTORE_KEY_NAME (ela expira sozinha em 1h)" >&2
+  RESTORE_KEY_NAME=""
+}
+
+cmd_s3_restore() {
+  local bucket="" path="" date="" replace=0 arg src key_name key_id key_secret
+  for arg in "$@"; do
+    case "$arg" in
+      --replace) replace=1 ;;
+      *) if [[ -z "$bucket" ]]; then bucket=$arg; elif [[ -z "$path" ]]; then path=$arg; elif [[ -z "$date" ]]; then date=$arg; else die "argumento a mais: $arg"; fi ;;
+    esac
+  done
+  [[ -n "$bucket" && -n "$path" ]] || die "uso: backup-restore s3 restore <bucket> <caminho> [data] [--replace]"
+  valid_bucket "$bucket"
+  valid_object_path "$path"
+  require_remote
+  docker ps --format '{{.Names}}' | grep -qx "$GARAGE_CONTAINER" || die "o container $GARAGE_CONTAINER não está rodando"
+  docker exec -e RUST_LOG=warn "$GARAGE_CONTAINER" /garage bucket info "$bucket" >/dev/null 2>&1 || die "o bucket $bucket não existe no Garage"
+  src=$(s3_source "$bucket" "$date")
+  "$RCLONE" lsf "$src/$path" >/dev/null 2>&1 || die "não achei $path em $src"
+
+  key_name="restore-$(date +%s)"
+  docker exec -e RUST_LOG=warn "$GARAGE_CONTAINER" /garage key create "$key_name" --expires-in 1h >/dev/null
+  RESTORE_KEY_NAME=$key_name
+  trap delete_restore_key EXIT
+  docker exec -e RUST_LOG=warn "$GARAGE_CONTAINER" /garage bucket allow --read --write "$bucket" --key "$key_name" >/dev/null
+  key_id=$(docker exec -e RUST_LOG=warn "$GARAGE_CONTAINER" /garage key info "$key_name" --key-id)
+  key_secret=$(docker exec -e RUST_LOG=warn "$GARAGE_CONTAINER" /garage key info "$key_name" --secret-key)
+
+  local -a mode=(--ignore-existing)
+  [[ "$replace" == 1 ]] && mode=()
+  local op=copyto
+  [[ "$path" == */ ]] && op=copy
+
+  info "Devolvendo $path ao bucket $bucket (origem: ${date:-cópia atual})"
+  RCLONE_CONFIG_GARAGE_TYPE=s3 \
+  RCLONE_CONFIG_GARAGE_PROVIDER=Other \
+  RCLONE_CONFIG_GARAGE_ENDPOINT="$GARAGE_S3_ENDPOINT" \
+  RCLONE_CONFIG_GARAGE_REGION=garage \
+  RCLONE_CONFIG_GARAGE_FORCE_PATH_STYLE=true \
+  RCLONE_CONFIG_GARAGE_ACCESS_KEY_ID="$key_id" \
+  RCLONE_CONFIG_GARAGE_SECRET_ACCESS_KEY="$key_secret" \
+    "$RCLONE" "$op" "$src/$path" "garage:$bucket/$path" "${mode[@]}" --log-level NOTICE
+  trap - EXIT
+  delete_restore_key
+  info "Pronto. A chave temporária $key_name foi apagada."
+  [[ "$replace" == 0 ]] && echo "Arquivos que já existiam no bucket não foram sobrescritos (use --replace para isso)."
+  return 0
+}
+
+cmd_s3() {
+  local sub=${1:-}
+  [[ -n "$sub" ]] || die "uso: backup-restore s3 <list|find|fetch|restore> ..."
+  shift
+  case "$sub" in
+    list) cmd_s3_list ;;
+    find) cmd_s3_find "$@" ;;
+    fetch) cmd_s3_fetch "$@" ;;
+    restore) cmd_s3_restore "$@" ;;
+    *) die "subcomando desconhecido: s3 $sub (use --help)" ;;
+  esac
+}
+
+[[ $# -ge 1 ]] || { usage; exit 1; }
+command=$1
+shift
+case "$command" in
+  -h|--help|help) usage ;;
+  list) cmd_list ;;
+  verify) cmd_verify "$@" ;;
+  fetch) cmd_fetch "$@" ;;
+  files) cmd_files "$@" ;;
+  db) cmd_db "$@" ;;
+  s3) cmd_s3 "$@" ;;
+  *) die "comando desconhecido: $command (use --help)" ;;
+esac

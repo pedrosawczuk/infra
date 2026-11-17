@@ -1,0 +1,63 @@
+services:
+  garage:
+    image: dxflrs/garage:v2.5.0
+    container_name: garage
+    restart: unless-stopped
+    env_file: .env
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage_meta:/var/lib/garage/meta
+      - garage_data:/var/lib/garage/data
+    ports:
+      - "127.0.0.1:3900:3900"
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - storage
+
+  webui:
+    image: khairul169/garage-webui:1.1.0
+    container_name: garage-webui
+    restart: unless-stopped
+    env_file: webui.env
+    environment:
+      API_BASE_URL: http://garage:3903
+      S3_ENDPOINT_URL: http://garage:3900
+      S3_REGION: garage
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+    ports:
+      - "127.0.0.1:3909:3909"
+    depends_on:
+      garage:
+        condition: service_healthy
+    networks:
+      - storage
+
+volumes:
+  garage_meta:
+    name: garage_meta
+  garage_data:
+    name: garage_data
+
+networks:
+  storage:
+    external: true

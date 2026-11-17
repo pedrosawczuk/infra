@@ -1,0 +1,33 @@
+# .github/workflows/deploy.yml de um projeto com Dockerfile na raiz.
+# Só faz deploy se o lint e os testes passarem.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm build
+
+  deploy:
+    needs: check
+    uses: pedrosawczuk/infra/.github/workflows/deploy-vps.yml@main
+    permissions:
+      contents: read
+      packages: write
+    with:
+      app: meu-app
+      # Deixe vazio se a migration já roda no start do container
+      migrate: node dist/migrate.js
+    secrets: inherit

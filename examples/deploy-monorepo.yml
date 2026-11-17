@@ -1,0 +1,41 @@
+# .github/workflows/deploy-api.yml de um monorepo (apps/api + packages/*).
+# Só roda quando muda algo que afeta a imagem da API.
+name: Deploy API
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - apps/api/**
+      - packages/**
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - turbo.json
+      - .dockerignore
+      - .github/workflows/deploy-api.yml
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm turbo run lint typecheck --filter=@app/api...
+
+  deploy:
+    needs: check
+    uses: pedrosawczuk/infra/.github/workflows/deploy-vps.yml@main
+    permissions:
+      contents: read
+      packages: write
+    with:
+      app: meu-sistema-api
+      dockerfile: apps/api/Dockerfile
+      migrate: node dist/migrate.js
+    secrets: inherit

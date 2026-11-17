@@ -1,0 +1,406 @@
+#!/usr/bin/env bash
+# new-app: prepara um projeto novo na VPS.
+# Cria a pasta do app com compose.yaml e .env, o banco no Postgres, o bucket no Garage e a rota no Caddy.
+set -euo pipefail
+
+KOMODO_DIR="${KOMODO_DIR:-$HOME/komodo}"
+CONFIG_FILE="$KOMODO_DIR/kit.env"
+APPS_DIR="$KOMODO_DIR/apps"
+CADDY_DIR="$KOMODO_DIR/caddy"
+
+usage() {
+  cat <<'EOF'
+Uso: new-app <nome> <dominio> [opções]
+
+  <nome>      nome do app: letras minúsculas, números e hífen.
+              Vira o nome da pasta, do serviço no compose, da imagem no GHCR e do banco.
+  <dominio>   domínio em que o app responde. Ex.: api.pedrosawczuk.dev
+
+Opções:
+  --path /prefixo   o app responde em <dominio>/prefixo
+                    (o prefixo é removido antes de a requisição chegar no app)
+  --port <porta>    porta em que o app escuta dentro do container (padrão: 3000)
+  --no-db           não cria banco nem DATABASE_URL
+  --redis           cria um usuário no Redis compartilhado e grava REDIS_URL
+  --s3              cria bucket e chave no Garage (S3) e grava as variáveis S3_*
+  --s3-quota <tam>  tamanho máximo do bucket (padrão: S3_DEFAULT_QUOTA do kit.env, ou 20GiB)
+  -h, --help        mostra esta ajuda
+
+Exemplos:
+  new-app estudazz api.pedrosawczuk.dev --path /estudazz
+  new-app portal-nib portal.pedrosawczuk.dev --redis --s3
+EOF
+}
+
+gen_secret() { openssl rand -hex 24; }
+
+die() { echo "Erro: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+warn() { echo "Aviso: $*" >&2; }
+
+# Codifica a senha para uso dentro da URL do banco (ex.: + vira %2B)
+urlencode() {
+  local LC_ALL=C s="$1" out="" c i hex
+  for ((i = 0; i < ${#s}; i++)); do
+    c="${s:i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# ---------- argumentos ----------
+NAME=""
+DOMAIN=""
+URL_PATH=""
+PORT="3000"
+WITH_DB=1
+WITH_REDIS=0
+WITH_S3=0
+S3_QUOTA=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --path) [[ $# -ge 2 ]] || die "--path precisa de um valor"; URL_PATH="$2"; shift 2 ;;
+    --port) [[ $# -ge 2 ]] || die "--port precisa de um valor"; PORT="$2"; shift 2 ;;
+    --no-db) WITH_DB=0; shift ;;
+    --redis) WITH_REDIS=1; shift ;;
+    --s3) WITH_S3=1; shift ;;
+    --s3-quota) [[ $# -ge 2 ]] || die "--s3-quota precisa de um valor"; S3_QUOTA="$2"; shift 2 ;;
+    --minio) die "o MinIO saiu do kit. Use --s3 (Garage)" ;;
+    -*) die "opção desconhecida: $1 (use --help)" ;;
+    *)
+      if [[ -z "$NAME" ]]; then NAME="$1"
+      elif [[ -z "$DOMAIN" ]]; then DOMAIN="$1"
+      else die "argumento a mais: $1"
+      fi
+      shift ;;
+  esac
+done
+
+[[ -n "$NAME" && -n "$DOMAIN" ]] || { usage; exit 1; }
+[[ "$NAME" =~ ^[a-z][a-z0-9-]{1,40}$ ]] || die "nome inválido: use minúsculas, números e hífen, começando com letra"
+[[ "$DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$ ]] || die "domínio inválido: $DOMAIN"
+[[ "$PORT" =~ ^[0-9]{2,5}$ ]] || die "porta inválida: $PORT"
+if [[ -n "$URL_PATH" ]]; then
+  URL_PATH="/${URL_PATH#/}"
+  URL_PATH="${URL_PATH%/}"
+  [[ "$URL_PATH" =~ ^/[a-z0-9/_-]+$ ]] || die "--path inválido: $URL_PATH"
+fi
+
+# ---------- configuração ----------
+[[ -f "$CONFIG_FILE" ]] || die "não achei $CONFIG_FILE. Copie o kit.env.example para lá e preencha."
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+: "${GHCR_OWNER:?defina GHCR_OWNER no kit.env}"
+: "${VPS_HOST:?defina VPS_HOST no kit.env}"
+PG_CONTAINER="${PG_CONTAINER:-postgres}"
+CADDY_CONTAINER="${CADDY_CONTAINER:-caddy}"
+GHCR_OWNER="${GHCR_OWNER,,}"
+REDIS_CONTAINER="${REDIS_CONTAINER:-redis}"
+REDIS_ADMIN_USER="${REDIS_ADMIN_USER:-admin}"
+GARAGE_CONTAINER="${GARAGE_CONTAINER:-garage}"
+S3_QUOTA="${S3_QUOTA:-${S3_DEFAULT_QUOTA:-20GiB}}"
+if [[ "$WITH_DB" == 1 ]]; then
+  : "${PG_ADMIN_USER:?defina PG_ADMIN_USER no kit.env}"
+  : "${PG_ADMIN_PASSWORD:?defina PG_ADMIN_PASSWORD no kit.env}"
+fi
+if [[ "$WITH_REDIS" == 1 ]]; then
+  : "${REDIS_ADMIN_PASSWORD:?defina REDIS_ADMIN_PASSWORD no kit.env}"
+fi
+if [[ "$WITH_S3" == 1 ]]; then
+  [[ ${#NAME} -ge 3 ]] || die "o nome precisa ter pelo menos 3 caracteres para virar bucket"
+  [[ "$S3_QUOTA" =~ ^[0-9]+(KB|MB|GB|TB|KiB|MiB|GiB|TiB)$ ]] || die "--s3-quota inválido: $S3_QUOTA (ex.: 20GiB)"
+fi
+
+APP_DIR="$APPS_DIR/$NAME"
+ROUTES_DIR="$CADDY_DIR/routes/$DOMAIN"
+ROUTE_FILE="$ROUTES_DIR/$NAME.caddy"
+SITE_FILE="$CADDY_DIR/sites/$DOMAIN.caddy"
+DB_NAME="${NAME//-/_}"
+
+# ---------- checagens antes de mexer em qualquer coisa ----------
+command -v docker >/dev/null || die "docker não encontrado"
+command -v openssl >/dev/null || die "openssl não encontrado"
+[[ -d "$CADDY_DIR/sites" && -d "$CADDY_DIR/routes" ]] || die "o Caddy não está no formato do kit (faltam $CADDY_DIR/sites e routes). Veja o README."
+docker ps --format '{{.Names}}' | grep -qx "$CADDY_CONTAINER" || die "container $CADDY_CONTAINER não está rodando"
+docker exec "$CADDY_CONTAINER" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
+  || die "a configuração atual do Caddy já está inválida. Corrija antes de criar um app (docker exec $CADDY_CONTAINER caddy validate --config /etc/caddy/Caddyfile)."
+[[ ! -e "$APP_DIR" ]] || die "$APP_DIR já existe"
+[[ ! -e "$ROUTE_FILE" ]] || die "já existe rota para $NAME em $DOMAIN"
+
+if [[ -d "$ROUTES_DIR" ]] && compgen -G "$ROUTES_DIR/*.caddy" >/dev/null; then
+  if grep -lq 'path=/$' "$ROUTES_DIR"/*.caddy; then
+    die "$DOMAIN já tem um app na raiz. Use outro domínio ou subdomínio."
+  fi
+  [[ -n "$URL_PATH" ]] || die "$DOMAIN já tem apps com --path. Para usar a raiz, escolha outro domínio."
+  if grep -lq "path=$URL_PATH\$" "$ROUTES_DIR"/*.caddy; then
+    die "o caminho $URL_PATH já está em uso em $DOMAIN"
+  fi
+fi
+
+if [[ "$WITH_DB" == 1 ]]; then
+  docker ps --format '{{.Names}}' | grep -qx "$PG_CONTAINER" || die "container $PG_CONTAINER não está rodando"
+fi
+if [[ "$WITH_REDIS" == 1 ]]; then
+  docker ps --format '{{.Names}}' | grep -qx "$REDIS_CONTAINER" || die "container $REDIS_CONTAINER não está rodando. Veja a instalação do Redis no README."
+fi
+if [[ "$WITH_S3" == 1 ]]; then
+  docker ps --format '{{.Names}}' | grep -qx "$GARAGE_CONTAINER" || die "container $GARAGE_CONTAINER não está rodando. Veja a instalação do Garage no README."
+  if docker exec -e RUST_LOG=warn "$GARAGE_CONTAINER" /garage key info "$NAME-app" --key-id >/dev/null 2>&1; then
+    die "já existe a chave $NAME-app no Garage"
+  fi
+fi
+
+# ---------- redes ----------
+NETS=(proxy)
+[[ "$WITH_DB" == 1 ]] && NETS+=(db)
+[[ "$WITH_REDIS" == 1 ]] && NETS+=(cache)
+[[ "$WITH_S3" == 1 ]] && NETS+=(storage)
+for net in "${NETS[@]}"; do
+  if ! docker network inspect "$net" >/dev/null 2>&1; then
+    info "Criando a rede $net"
+    if [[ "$net" == cache ]]; then
+      docker network create --internal "$net" >/dev/null
+    else
+      docker network create "$net" >/dev/null
+    fi
+  fi
+done
+
+# ---------- banco ----------
+DATABASE_URL=""
+if [[ "$WITH_DB" == 1 ]]; then
+  pg() { docker exec "$PG_CONTAINER" psql -U "$PG_ADMIN_USER" -d postgres -tAqc "$1"; }
+  db_exists=$(pg "SELECT 1 FROM pg_database WHERE datname = '$DB_NAME'")
+  role_exists=$(pg "SELECT 1 FROM pg_roles WHERE rolname = '$DB_NAME'")
+  if [[ "$db_exists" == "1" && "$role_exists" != "1" ]]; then
+    warn "o banco $DB_NAME já existe sem usuário próprio, vou apontar o .env para o admin"
+    DATABASE_URL="postgresql://$PG_ADMIN_USER:$(urlencode "$PG_ADMIN_PASSWORD")@$PG_CONTAINER:5432/$DB_NAME"
+  else
+    DB_PASSWORD=$(gen_secret)
+    if [[ "$role_exists" == "1" ]]; then
+      pg "ALTER ROLE \"$DB_NAME\" PASSWORD '$DB_PASSWORD'" >/dev/null
+    else
+      info "Criando o usuário $DB_NAME"
+      pg "CREATE ROLE \"$DB_NAME\" LOGIN PASSWORD '$DB_PASSWORD'" >/dev/null
+    fi
+    if [[ "$db_exists" != "1" ]]; then
+      info "Criando o banco $DB_NAME"
+      pg "CREATE DATABASE \"$DB_NAME\" OWNER \"$DB_NAME\"" >/dev/null
+    fi
+    DATABASE_URL="postgresql://$DB_NAME:$DB_PASSWORD@$PG_CONTAINER:5432/$DB_NAME"
+  fi
+fi
+
+# ---------- redis ----------
+REDIS_URL=""
+if [[ "$WITH_REDIS" == 1 ]]; then
+  redis_admin() {
+    docker exec -e REDISCLI_AUTH="$REDIS_ADMIN_PASSWORD" "$REDIS_CONTAINER" \
+      redis-cli --user "$REDIS_ADMIN_USER" --no-auth-warning "$@"
+  }
+  REDIS_PASSWORD=$(gen_secret)
+  info "Criando o usuário $NAME no Redis (chaves com prefixo $NAME:)"
+  redis_admin ACL SETUSER "$NAME" reset on ">$REDIS_PASSWORD" "~$NAME:*" "&$NAME:*" +@all -@admin >/dev/null
+  redis_admin ACL SAVE >/dev/null
+  REDIS_URL="redis://$NAME:$REDIS_PASSWORD@$REDIS_CONTAINER:6379"
+fi
+
+# ---------- garage (s3) ----------
+S3_ACCESS_KEY=""
+S3_SECRET=""
+if [[ "$WITH_S3" == 1 ]]; then
+  garage() { docker exec -e RUST_LOG=warn "$GARAGE_CONTAINER" /garage "$@"; }
+  info "Criando o bucket $NAME (limite $S3_QUOTA) e a chave $NAME-app no Garage"
+  garage bucket info "$NAME" >/dev/null 2>&1 || garage bucket create "$NAME" >/dev/null
+  garage bucket set-quotas --max-size "$S3_QUOTA" "$NAME" >/dev/null
+  garage key create "$NAME-app" >/dev/null
+  garage bucket allow --read --write "$NAME" --key "$NAME-app" >/dev/null
+  if garage key info backup --key-id >/dev/null 2>&1; then
+    garage bucket allow --read "$NAME" --key backup >/dev/null
+  fi
+  S3_ACCESS_KEY=$(garage key info "$NAME-app" --key-id)
+  S3_SECRET=$(garage key info "$NAME-app" --secret-key)
+  [[ -n "$S3_ACCESS_KEY" && -n "$S3_SECRET" ]] || die "não consegui ler a chave $NAME-app do Garage"
+fi
+
+# ---------- pasta do app ----------
+info "Criando $APP_DIR"
+mkdir -p "$APP_DIR"
+
+NETWORKS_YAML=""
+NETWORKS_DEF=""
+for net in "${NETS[@]}"; do
+  [[ -n "$NETWORKS_YAML" ]] && NETWORKS_YAML+=$'\n'
+  [[ -n "$NETWORKS_DEF" ]] && NETWORKS_DEF+=$'\n'
+  NETWORKS_YAML+="      - $net"
+  NETWORKS_DEF+="  $net:"$'\n'"    external: true"
+done
+
+cat > "$APP_DIR/compose.yaml" <<EOF
+# Gerado pelo new-app. Sem container_name e sem ports: o docker-rollout precisa disso
+# para subir uma instância nova ao lado da antiga.
+services:
+  $NAME:
+    image: ghcr.io/$GHCR_OWNER/$NAME:\${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    env_file: .env
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+$NETWORKS_YAML
+
+networks:
+$NETWORKS_DEF
+EOF
+
+{
+  echo "NODE_ENV=production"
+  echo "PORT=$PORT"
+  [[ -n "$DATABASE_URL" ]] && echo "DATABASE_URL=$DATABASE_URL"
+  [[ -n "$REDIS_URL" ]] && echo "REDIS_URL=$REDIS_URL"
+  if [[ -n "$S3_SECRET" ]]; then
+    echo "S3_ENDPOINT=http://$GARAGE_CONTAINER:3900"
+    echo "S3_REGION=garage"
+    echo "S3_BUCKET=$NAME"
+    echo "S3_ACCESS_KEY=$S3_ACCESS_KEY"
+    echo "S3_SECRET_KEY=$S3_SECRET"
+    echo "S3_FORCE_PATH_STYLE=true"
+  fi
+  echo ""
+  echo "# Adicione abaixo as outras variáveis do app"
+} > "$APP_DIR/.env"
+chmod 600 "$APP_DIR/.env"
+
+# ---------- Caddy ----------
+CREATED_SITE=0
+mkdir -p "$ROUTES_DIR"
+
+UPSTREAM="reverse_proxy {
+		dynamic a $NAME $PORT {
+			refresh 1s
+		}
+		lb_policy round_robin
+		lb_try_duration 10s
+		lb_try_interval 250ms
+		fail_duration 10s
+	}"
+
+if [[ -n "$URL_PATH" ]]; then
+  cat > "$ROUTE_FILE" <<EOF
+# new-app: $NAME path=$URL_PATH
+redir $URL_PATH $URL_PATH/ 308
+
+handle_path $URL_PATH/* {
+	$UPSTREAM
+}
+EOF
+else
+  cat > "$ROUTE_FILE" <<EOF
+# new-app: $NAME path=/
+handle {
+	$UPSTREAM
+}
+EOF
+fi
+
+if [[ ! -f "$SITE_FILE" ]]; then
+  CREATED_SITE=1
+  if [[ -n "$URL_PATH" ]]; then
+    cat > "$SITE_FILE" <<EOF
+# Gerado pelo new-app. As rotas de cada app ficam em routes/$DOMAIN/
+$DOMAIN {
+	import /etc/caddy/routes/$DOMAIN/*.caddy
+
+	handle {
+		respond "Not found" 404
+	}
+}
+EOF
+  else
+    cat > "$SITE_FILE" <<EOF
+# Gerado pelo new-app. As rotas de cada app ficam em routes/$DOMAIN/
+$DOMAIN {
+	import /etc/caddy/routes/$DOMAIN/*.caddy
+}
+EOF
+  fi
+fi
+
+info "Validando a configuração do Caddy"
+if ! docker exec "$CADDY_CONTAINER" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
+  rm -f "$ROUTE_FILE"
+  [[ "$CREATED_SITE" == 1 ]] && rm -f "$SITE_FILE"
+  rmdir "$ROUTES_DIR" 2>/dev/null || true
+  docker exec "$CADDY_CONTAINER" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile || true
+  rm -rf "$APP_DIR"
+  die "a configuração do Caddy ficou inválida. Desfiz a rota e a pasta do app (banco, usuário do Redis e bucket do Garage, se criados, continuam lá)."
+fi
+docker exec "$CADDY_CONTAINER" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1
+info "Caddy recarregado"
+
+# ---------- DNS ----------
+DNS_OK=1
+resolved=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk 'NR==1 {print $1}' || true)
+if [[ "$resolved" != "$VPS_HOST" ]]; then
+  DNS_OK=0
+fi
+
+# ---------- próximos passos ----------
+URL="https://$DOMAIN${URL_PATH:-}"
+
+# Chamado pelo init-deploy: ele mesmo cuida dos secrets e do workflow
+if [[ "${NEW_APP_NO_HINTS:-0}" == 1 ]]; then
+  info "App $NAME preparado em $APP_DIR"
+  if [[ "$DNS_OK" == 0 ]]; then
+    warn "$DOMAIN ainda não aponta para $VPS_HOST (resolveu: ${resolved:-nada}). Crie o registro A."
+  fi
+  exit 0
+fi
+cat <<EOF
+
+Pronto. O app $NAME está preparado em $APP_DIR
+
+Próximos passos:
+EOF
+
+step=1
+if [[ "$DNS_OK" == 0 ]]; then
+  echo "  $step. DNS: $DOMAIN ainda não aponta para $VPS_HOST (resolveu: ${resolved:-nada})."
+  echo "     Crie um registro A com o host certo apontando para $VPS_HOST."
+  step=$((step + 1))
+fi
+
+cat <<EOF
+  $step. Complete o .env com as variáveis do app:
+     nano $APP_DIR/.env
+
+  $((step + 1)). No seu PC, cadastre os secrets no repositório (troque REPO):
+     gh secret set VPS_HOST -R $GHCR_OWNER/REPO -b "$VPS_HOST"
+     gh secret set VPS_USER -R $GHCR_OWNER/REPO -b "$(id -un)"
+     gh secret set VPS_SSH_KEY -R $GHCR_OWNER/REPO < caminho/da/chave_de_deploy
+
+  $((step + 2)). Crie .github/workflows/deploy.yml no repositório:
+
+name: Deploy
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    uses: $GHCR_OWNER/infra/.github/workflows/deploy-vps.yml@main
+    permissions:
+      contents: read
+      packages: write
+    with:
+      app: $NAME
+    secrets: inherit
+
+  $((step + 3)). Faça push na main e teste:
+     curl $URL/health
+EOF

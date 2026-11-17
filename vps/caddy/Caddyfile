@@ -1,0 +1,3 @@
+# Cada domínio tem um arquivo em sites/ e as rotas de cada app ficam em routes/<dominio>/.
+# Os dois são criados pelo new-app. Evite editar este arquivo.
+import /etc/caddy/sites/*.caddy

@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# init-deploy: configura o deploy de um repositório na VPS, de ponta a ponta.
+# Rode no seu PC, de dentro do repositório (no Windows, pelo Git Bash).
+#
+# Sem argumentos, abre o modo interativo (perguntas com padrões detectados do projeto).
+# Com argumentos, funciona só por flags, ideal para scripts.
+#
+# O que ele faz:
+#   1. Roda o new-app na VPS por SSH (pasta, compose, .env, Postgres/Redis/S3 e rota no Caddy)
+#   2. Envia as variáveis de um arquivo .env local para o .env do app na VPS (opcional)
+#   3. Cadastra os secrets VPS_HOST, VPS_USER e VPS_SSH_KEY no repositório com o gh
+#   4. Gera .github/workflows/deploy.yml com os checks que o projeto tiver
+set -euo pipefail
+
+CONFIG_FILE="${INFRA_KIT_CONFIG:-$HOME/.config/infra-kit.env}"
+STATE_FILE="${CONFIG_FILE%.env}.last"
+WORKFLOW=".github/workflows/deploy.yml"
+
+usage() {
+  cat <<'EOF'
+Uso: init-deploy                       (modo interativo)
+     init-deploy <nome> <dominio> [opções]
+
+Rode de dentro do repositório do projeto.
+
+  <nome>      nome do app (minúsculas, números e hífen)
+  <dominio>   domínio em que o app responde. Ex.: api.pedrosawczuk.dev
+
+Opções da VPS (repassadas ao new-app):
+  --path /prefixo        o app responde em <dominio>/prefixo
+  --port <porta>         porta do app no container (padrão: 3000)
+  --no-db                não cria banco no Postgres
+  --redis                cria usuário no Redis compartilhado (REDIS_URL)
+  --s3                   cria bucket e chave no Garage (S3_*)
+  --s3-quota <tam>       tamanho máximo do bucket (ex.: 20GiB)
+
+Opções do workflow:
+  --dockerfile <caminho> Dockerfile a partir da raiz (padrão: Dockerfile)
+  --migrate "<comando>"  migration rodada antes da troca. Ex.: "node dist/migrate.js"
+  --no-check             não gera o job de lint/typecheck/test/build
+
+Outras:
+  --env-file <arquivo>   envia as variáveis desse arquivo para o .env do app na VPS
+                         (as que a VPS já define são ignoradas)
+  --skip-vps             não roda o new-app (o app já existe na VPS)
+  --force                sobrescreve um deploy.yml existente
+  --push                 faz commit do workflow e push (dispara o primeiro deploy)
+  -h, --help             mostra esta ajuda
+
+Exemplos:
+  init-deploy estudazz api.pedrosawczuk.dev --path /estudazz --env-file .env.production
+  init-deploy meu-sistema-api api.meusistema.com.br --redis --s3 --dockerfile apps/api/Dockerfile --migrate "node dist/migrate.js"
+EOF
+}
+
+die() { echo "Erro: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+warn() { echo "Aviso: $*" >&2; }
+
+ask() {
+  local var="$1" prompt="$2" default="${3:-}" reply value
+  if [[ -n "$default" ]]; then
+    read -r -p "$prompt [$default]: " reply
+  else
+    read -r -p "$prompt: " reply
+  fi
+  if [[ "$reply" == "-" ]]; then value=""; else value="${reply:-$default}"; fi
+  printf -v "$var" '%s' "$value"
+}
+
+confirm() {
+  local prompt="$1" default="${2:-S}" hint="[S/n]" reply
+  [[ "$default" == "N" ]] && hint="[s/N]"
+  read -r -p "$prompt $hint: " reply
+  reply="${reply:-$default}"
+  [[ "$reply" =~ ^[sSyY] ]]
+}
+
+pick_services() {
+  if command -v gum >/dev/null 2>&1; then
+    local chosen
+    chosen=$(gum choose --no-limit --header "Serviços (espaço marca, Enter confirma)" --selected "Postgres" Postgres Redis S3) || true
+    WITH_DB=0; WITH_REDIS=0; WITH_S3=0
+    grep -qx Postgres <<<"$chosen" && WITH_DB=1
+    grep -qx Redis <<<"$chosen" && WITH_REDIS=1
+    grep -qx S3 <<<"$chosen" && WITH_S3=1
+  else
+    WITH_DB=0; WITH_REDIS=0; WITH_S3=0
+    confirm "Usar Postgres?" S && WITH_DB=1
+    confirm "Usar Redis?" N && WITH_REDIS=1
+    confirm "Usar S3 (Garage)?" N && WITH_S3=1
+  fi
+  return 0
+}
+
+detect_dockerfile() {
+  if [[ -f Dockerfile ]]; then
+    echo "Dockerfile"
+  else
+    find apps -maxdepth 2 -name Dockerfile 2>/dev/null | head -n 1 || true
+  fi
+}
+
+detect_env_file() {
+  local f
+  for f in .env.production .env.prod; do
+    if [[ -f "$f" ]]; then echo "$f"; return 0; fi
+  done
+  return 0
+}
+
+yes_no() { [[ "$1" == 1 ]] && echo "sim" || echo "não"; }
+
+# ---------- argumentos ----------
+ORIG_ARGC=$#
+NAME=""; DOMAIN=""
+URL_PATH=""; PORT="3000"
+WITH_DB=1; WITH_REDIS=0; WITH_S3=0; S3_QUOTA=""
+DOCKERFILE="Dockerfile"; MIGRATE=""; WITH_CHECK=1
+ENV_FILE=""; SKIP_VPS=0; FORCE=0; PUSH=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --path) [[ $# -ge 2 ]] || die "--path precisa de um valor"; URL_PATH="$2"; shift 2 ;;
+    --port) [[ $# -ge 2 ]] || die "--port precisa de um valor"; PORT="$2"; shift 2 ;;
+    --no-db) WITH_DB=0; shift ;;
+    --redis) WITH_REDIS=1; shift ;;
+    --s3) WITH_S3=1; shift ;;
+    --s3-quota) [[ $# -ge 2 ]] || die "--s3-quota precisa de um valor"; S3_QUOTA="$2"; shift 2 ;;
+    --minio) die "o MinIO saiu do kit. Use --s3 (Garage)" ;;
+    --dockerfile) [[ $# -ge 2 ]] || die "--dockerfile precisa de um valor"; DOCKERFILE="$2"; shift 2 ;;
+    --migrate) [[ $# -ge 2 ]] || die "--migrate precisa de um valor"; MIGRATE="$2"; shift 2 ;;
+    --no-check) WITH_CHECK=0; shift ;;
+    --env-file) [[ $# -ge 2 ]] || die "--env-file precisa de um valor"; ENV_FILE="$2"; shift 2 ;;
+    --skip-vps) SKIP_VPS=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --push) PUSH=1; shift ;;
+    -*) die "opção desconhecida: $1 (use --help)" ;;
+    *)
+      if [[ -z "$NAME" ]]; then NAME="$1"
+      elif [[ -z "$DOMAIN" ]]; then DOMAIN="$1"
+      else die "argumento a mais: $1"
+      fi
+      shift ;;
+  esac
+done
+
+INTERACTIVE=0
+if [[ "$ORIG_ARGC" -eq 0 ]]; then
+  [[ -t 0 && -t 1 ]] || { usage; exit 1; }
+  INTERACTIVE=1
+elif [[ -z "$NAME" ]]; then
+  usage; exit 1
+fi
+
+# ---------- configuração ----------
+[[ -f "$CONFIG_FILE" ]] || die "não achei $CONFIG_FILE. Copie o infra-kit.env.example para lá e preencha."
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+: "${VPS_HOST:?defina VPS_HOST em $CONFIG_FILE}"
+: "${VPS_USER:?defina VPS_USER em $CONFIG_FILE}"
+: "${DEPLOY_KEY:?defina DEPLOY_KEY em $CONFIG_FILE}"
+INFRA_REPO="${INFRA_REPO:-pedrosawczuk/infra}"
+DEPLOY_KEY="${DEPLOY_KEY/#\~/$HOME}"
+
+LAST_DOMAIN=""
+if [[ -f "$STATE_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$STATE_FILE"
+fi
+
+# ---------- checagens do ambiente ----------
+command -v git >/dev/null || die "git não encontrado"
+command -v gh >/dev/null || die "gh não encontrado. Instale o GitHub CLI e rode: gh auth login"
+command -v ssh >/dev/null || die "ssh não encontrado"
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "rode de dentro de um repositório git"
+cd "$(git rev-parse --show-toplevel)"
+
+gh auth status >/dev/null 2>&1 || die "o gh não está logado. Rode: gh auth login"
+REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) \
+  || die "não achei o repositório no GitHub. Crie com: gh repo create --source . --private --push"
+
+[[ -f "$DEPLOY_KEY" ]] || die "chave de deploy não encontrada em $DEPLOY_KEY"
+
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+# ---------- modo interativo ----------
+if [[ "$INTERACTIVE" == 1 ]]; then
+  default_name=$(basename "$PWD" | tr 'A-Z' 'a-z' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')
+  default_dockerfile=$(detect_dockerfile)
+
+  echo "Configurando o deploy de $REPO"
+  echo "(Enter aceita o valor entre colchetes. Digite - para deixar um campo vazio.)"
+  echo ""
+  ask NAME "Nome do app" "$default_name"
+  ask DOMAIN "Domínio" "$LAST_DOMAIN"
+  ask URL_PATH "Caminho no domínio (vazio = raiz)" ""
+  ask PORT "Porta do app no container" "3000"
+  pick_services
+  ask DOCKERFILE "Dockerfile" "${default_dockerfile:-Dockerfile}"
+  ask ENV_FILE "Arquivo de variáveis para enviar à VPS" "$(detect_env_file)"
+  ask MIGRATE "Comando de migration (vazio = nenhum)" ""
+  confirm "Gerar o job de checks (lint, typecheck, test, build)?" S || WITH_CHECK=0
+  if [[ -f "$WORKFLOW" ]]; then
+    confirm "$WORKFLOW já existe. Sobrescrever?" N && FORCE=1
+  fi
+  if [[ "$BRANCH" == "main" ]]; then
+    confirm "Fazer commit e push do workflow agora (dispara o primeiro deploy)?" N && PUSH=1
+  fi
+
+  echo ""
+  echo "Resumo"
+  echo "  Repositório : $REPO"
+  echo "  App         : $NAME"
+  echo "  URL         : https://$DOMAIN${URL_PATH:+/${URL_PATH#/}}"
+  echo "  Porta       : $PORT"
+  echo "  Postgres    : $(yes_no "$WITH_DB")"
+  echo "  Redis       : $(yes_no "$WITH_REDIS")"
+  echo "  S3 (Garage) : $(yes_no "$WITH_S3")${S3_QUOTA:+ (limite $S3_QUOTA)}"
+  echo "  Dockerfile  : $DOCKERFILE"
+  echo "  Variáveis   : ${ENV_FILE:-nenhuma}"
+  echo "  Migration   : ${MIGRATE:-nenhuma}"
+  echo "  Checks      : $(yes_no "$WITH_CHECK")"
+  echo "  Push        : $(yes_no "$PUSH")"
+  echo ""
+  confirm "Confirmar?" S || die "cancelado"
+  echo ""
+fi
+
+# ---------- validações ----------
+[[ -n "$NAME" ]] || die "informe o nome do app"
+[[ "$NAME" =~ ^[a-z][a-z0-9-]{1,40}$ ]] || die "nome inválido: use minúsculas, números e hífen"
+[[ "$SKIP_VPS" == 1 || -n "$DOMAIN" ]] || die "informe o domínio (ou use --skip-vps se o app já existe na VPS)"
+
+[[ -f "$DOCKERFILE" ]] || warn "$DOCKERFILE não existe. O deploy vai falhar até ele existir (veja o prompt no README do infra)."
+[[ -z "$ENV_FILE" || -f "$ENV_FILE" ]] || die "arquivo $ENV_FILE não encontrado"
+[[ ! -f "$WORKFLOW" || "$FORCE" == 1 ]] || die "$WORKFLOW já existe. Use --force para sobrescrever."
+
+if [[ "$PUSH" == 1 ]]; then
+  [[ "$BRANCH" == "main" ]] || die "--push só funciona na branch main (você está em $BRANCH)"
+fi
+
+info "Repositório: $REPO"
+
+# ---------- 1. VPS ----------
+SSH_TARGET="$VPS_USER@$VPS_HOST"
+if [[ "$SKIP_VPS" == 0 ]]; then
+  VPS_ARGS=(--port "$PORT")
+  [[ -n "$URL_PATH" ]] && VPS_ARGS+=(--path "$URL_PATH")
+  [[ "$WITH_DB" == 0 ]] && VPS_ARGS+=(--no-db)
+  [[ "$WITH_REDIS" == 1 ]] && VPS_ARGS+=(--redis)
+  [[ "$WITH_S3" == 1 ]] && VPS_ARGS+=(--s3)
+  [[ -n "$S3_QUOTA" ]] && VPS_ARGS+=(--s3-quota "$S3_QUOTA")
+
+  info "Preparando o app na VPS"
+  remote_cmd="NEW_APP_NO_HINTS=1 \$HOME/.local/bin/new-app $(printf '%q ' "$NAME" "$DOMAIN" "${VPS_ARGS[@]}")"
+  ssh "$SSH_TARGET" "$remote_cmd"
+
+  if [[ -n "$DOMAIN" ]]; then
+    printf 'LAST_DOMAIN=%s\n' "$DOMAIN" > "$STATE_FILE"
+  fi
+fi
+
+# ---------- 2. .env ----------
+if [[ -n "$ENV_FILE" ]]; then
+  info "Enviando as variáveis de $ENV_FILE"
+  IGNORED="NODE_ENV|PORT"
+  [[ "$WITH_DB" == 1 ]] && IGNORED+="|DATABASE_URL"
+  [[ "$WITH_REDIS" == 1 ]] && IGNORED+="|REDIS_URL"
+  [[ "$WITH_S3" == 1 ]] && IGNORED+="|S3_ENDPOINT|S3_REGION|S3_BUCKET|S3_ACCESS_KEY|S3_SECRET_KEY|S3_FORCE_PATH_STYLE"
+  filtered=$(grep -vE '^[[:space:]]*(#|$)' "$ENV_FILE" | grep -vE "^[[:space:]]*(export[[:space:]]+)?($IGNORED)=" | tr -d '\r' | sed -E 's/^[[:space:]]*export[[:space:]]+//' || true)
+  if [[ -n "$filtered" ]]; then
+    printf '%s\n' "$filtered" | ssh "$SSH_TARGET" "cat >> \$HOME/komodo/apps/$(printf '%q' "$NAME")/.env"
+    info "$(printf '%s\n' "$filtered" | wc -l | tr -d ' ') variáveis enviadas"
+  else
+    warn "$ENV_FILE não tem variáveis além das que a VPS já define"
+  fi
+fi
+
+# ---------- 3. secrets ----------
+info "Cadastrando os secrets em $REPO"
+gh secret set VPS_HOST -R "$REPO" -b "$VPS_HOST" >/dev/null
+gh secret set VPS_USER -R "$REPO" -b "$VPS_USER" >/dev/null
+gh secret set VPS_SSH_KEY -R "$REPO" < "$DEPLOY_KEY" >/dev/null
+
+# ---------- 4. workflow ----------
+info "Gerando $WORKFLOW"
+mkdir -p .github/workflows
+
+CHECK_JOB=""
+if [[ "$WITH_CHECK" == 1 && -f package.json ]]; then
+  if ! command -v node >/dev/null; then
+    warn "node não encontrado, vou gerar o workflow sem o job de checks"
+  else
+    if [[ -f pnpm-lock.yaml ]]; then PM=pnpm; INSTALL="pnpm install --frozen-lockfile"
+    elif [[ -f yarn.lock ]]; then
+      PM=yarn
+      if [[ -f .yarnrc.yml ]]; then INSTALL="yarn install --immutable"; else INSTALL="yarn install --frozen-lockfile"; fi
+    else PM=npm; INSTALL="npm ci"
+    fi
+
+    SCRIPTS=$(node -e '
+      const p = require("./package.json");
+      const s = p.scripts || {};
+      console.log(["lint", "typecheck", "test", "build"].filter(k => s[k]).join(" "));
+    ')
+    HAS_PM_FIELD=$(node -e 'console.log(require("./package.json").packageManager ? 1 : 0)')
+
+    if [[ -f .nvmrc ]]; then NODE_LINE="node-version-file: .nvmrc"; else NODE_LINE="node-version: 24"; fi
+
+    CHECK_JOB="  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5"
+    if [[ "$PM" == pnpm ]]; then
+      if [[ "$HAS_PM_FIELD" == 1 ]]; then
+        CHECK_JOB+="
+      - uses: pnpm/action-setup@v4"
+      else
+        CHECK_JOB+="
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10"
+      fi
+    fi
+    CHECK_JOB+="
+      - uses: actions/setup-node@v4
+        with:
+          $NODE_LINE
+          cache: $PM
+      - run: $INSTALL"
+    for s in $SCRIPTS; do
+      CHECK_JOB+="
+      - run: $PM run $s"
+    done
+    [[ -n "$SCRIPTS" ]] || warn "o package.json não tem lint, typecheck, test nem build. O job de checks só vai instalar as dependências."
+  fi
+fi
+
+{
+  echo "# Gerado pelo init-deploy. Cada push na main roda os checks e faz deploy na VPS."
+  echo "name: Deploy"
+  echo ""
+  echo "on:"
+  echo "  push:"
+  echo "    branches: [main]"
+  echo "  workflow_dispatch:"
+  echo ""
+  echo "jobs:"
+  if [[ -n "$CHECK_JOB" ]]; then
+    printf '%s\n\n' "$CHECK_JOB"
+  fi
+  echo "  deploy:"
+  [[ -n "$CHECK_JOB" ]] && echo "    needs: check"
+  echo "    uses: $INFRA_REPO/.github/workflows/deploy-vps.yml@main"
+  echo "    permissions:"
+  echo "      contents: read"
+  echo "      packages: write"
+  echo "    with:"
+  echo "      app: $NAME"
+  [[ "$DOCKERFILE" != "Dockerfile" ]] && echo "      dockerfile: $DOCKERFILE"
+  if [[ -n "$MIGRATE" ]]; then
+    escaped=${MIGRATE//\'/\'\'}
+    echo "      migrate: '$escaped'"
+  fi
+  echo "    secrets: inherit"
+} > "$WORKFLOW"
+
+# ---------- 5. push ----------
+if [[ "$PUSH" == 1 ]]; then
+  info "Fazendo commit e push"
+  git add "$WORKFLOW"
+  git commit -m "ci: deploy automático na VPS" >/dev/null
+  git push
+  info "Push feito. Acompanhe com: gh run watch"
+else
+  cat <<EOF
+
+Pronto. Falta só revisar e subir o workflow:
+  git add $WORKFLOW
+  git commit -m "ci: deploy automático na VPS"
+  git push
+
+Depois, acompanhe com: gh run watch
+EOF
+fi

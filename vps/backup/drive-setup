@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+RCLONE="${RCLONE_BIN:-$HOME/.local/bin/rclone}"
+REMOTE="${1:-gdrive}"
+ROOT_FOLDER="${DRIVE_ROOT_FOLDER:-backups-vps}"
+
+die() { echo "Erro: $*" >&2; exit 1; }
+
+[[ -x "$RCLONE" ]] || die "rclone não encontrado em $RCLONE"
+command -v python3 >/dev/null || die "python3 não encontrado"
+[[ -t 0 ]] || die "rode num terminal interativo"
+if "$RCLONE" listremotes | grep -qx "$REMOTE:"; then
+  die "o remote $REMOTE já existe. Para refazer: $RCLONE config delete $REMOTE"
+fi
+
+CONF=$("$RCLONE" config file | tail -n 1)
+mkdir -p "$(dirname "$CONF")"
+chmod 700 "$(dirname "$CONF")"
+
+read -rp 'Client ID: ' client_id
+read -rsp 'Client secret (não aparece): ' client_secret; echo
+read -rsp 'Token do rclone authorize (não aparece): ' raw_token; echo
+
+[[ "$client_id" == *.apps.googleusercontent.com ]] || die "o Client ID termina com .apps.googleusercontent.com"
+[[ -n "$client_secret" ]] || die "client secret vazio"
+
+printf '%s\n%s\n%s\n' "$client_id" "$client_secret" "$raw_token" | python3 -I -c '
+import base64, json, sys
+
+conf_path, remote = sys.argv[1], sys.argv[2]
+client_id, client_secret, raw = (line.strip() for line in sys.stdin.read().split("\n")[:3])
+
+if not raw.startswith("{"):
+    padded = raw.replace("-", "+").replace("_", "/") + "=" * (-len(raw) % 4)
+    raw = base64.b64decode(padded).decode()
+
+data = json.loads(raw)
+token = data.get("token", data)
+if isinstance(token, str):
+    token = json.loads(token)
+if not token.get("refresh_token"):
+    sys.exit("token sem refresh_token")
+
+token_json = json.dumps(token, separators=(",", ":"))
+section = (
+    f"\n[{remote}]\n"
+    "type = drive\n"
+    f"client_id = {client_id}\n"
+    f"client_secret = {client_secret}\n"
+    "scope = drive.file\n"
+    f"token = {token_json}\n"
+)
+with open(conf_path, "a", encoding="utf-8") as conf:
+    conf.write(section)
+' "$CONF" "$REMOTE" || die "token inválido. Copie tudo o que o rclone authorize imprimiu entre as setas."
+
+unset client_secret raw_token
+chmod 600 "$CONF"
+
+"$RCLONE" mkdir "$REMOTE:$ROOT_FOLDER" || {
+  "$RCLONE" config delete "$REMOTE"
+  die "o Google recusou o acesso. Desfiz a configuração. Confira o Client ID, o secret e se o token foi gerado com eles."
+}
+"$RCLONE" lsd "$REMOTE:" | grep -q " $ROOT_FOLDER\$" || die "a pasta $ROOT_FOLDER não apareceu no Drive"
+
+echo "✅ Drive conectado. A pasta $ROOT_FOLDER já está no seu Drive."
